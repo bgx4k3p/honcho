@@ -403,6 +403,42 @@ class TestRepresentationWithScope:
         assert resp.status_code == 200
         assert "fact" not in resp.json()["representation"]
 
+    async def test_scalar_scope_revokes_removed_session(
+        self,
+        client: TestClient,
+        db_session: AsyncSession,
+        sample_data: tuple[Workspace, Peer],
+    ):
+        workspace, peer = sample_data
+        scope_name = str(generate_nanoid())
+        _create_scope(client, workspace.name, scope_name)
+        session_name = _create_session(client, workspace.name)
+        _add_sessions_to_scope(client, workspace.name, scope_name, [session_name])
+        await _seed_documents(
+            db_session,
+            workspace.name,
+            observer=scope_peer_name(scope_name),
+            observed=peer.name,
+            contents=[("removed scalar scope fact", session_name)],
+        )
+
+        response = client.post(
+            f"/v3/workspaces/{workspace.name}/peers/{peer.name}/representation",
+            json={"scope": scope_name},
+        )
+        assert response.status_code == 200
+        assert "removed scalar scope fact" in response.json()["representation"]
+        response = client.delete(
+            f"/v3/workspaces/{workspace.name}/scopes/{scope_name}/sessions/{session_name}"
+        )
+        assert response.status_code == 204
+        response = client.post(
+            f"/v3/workspaces/{workspace.name}/peers/{peer.name}/representation",
+            json={"scope": scope_name},
+        )
+        assert response.status_code == 200
+        assert "removed scalar scope fact" not in response.json()["representation"]
+
     async def test_scope_list_revokes_removed_session(
         self,
         client: TestClient,
@@ -419,19 +455,25 @@ class TestRepresentationWithScope:
             workspace.name,
             observer=peer.name,
             observed=peer.name,
-            contents=[("removed scope fact", session_name)],
+            contents=[("removed list scope fact", session_name)],
         )
 
+        response = client.post(
+            f"/v3/workspaces/{workspace.name}/peers/{peer.name}/representation",
+            json={"scope": [scope_name]},
+        )
+        assert response.status_code == 200
+        assert "removed list scope fact" in response.json()["representation"]
         response = client.delete(
             f"/v3/workspaces/{workspace.name}/scopes/{scope_name}/sessions/{session_name}"
         )
         assert response.status_code == 204
         response = client.post(
             f"/v3/workspaces/{workspace.name}/peers/{peer.name}/representation",
-            json={"scope": scope_name},
+            json={"scope": [scope_name]},
         )
         assert response.status_code == 200
-        assert "removed scope fact" not in response.json()["representation"]
+        assert "removed list scope fact" not in response.json()["representation"]
 
 
 class TestWorkspaceMessageSearchWithScope:

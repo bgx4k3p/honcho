@@ -447,6 +447,125 @@ async def test_stale_removal_after_readd_preserves_live_copy_and_status(
     )
 
 
+@pytest.mark.asyncio
+async def test_removal_lock_blocks_readd_then_backfill_restores_one_copy(
+    db_session: AsyncSession,
+    sample_data: tuple[models.Workspace, models.Peer],
+    db_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    test_workspace, sender = sample_data
+    workspace_name = test_workspace.name
+    scope_peer = await _create_scope_peer(
+        db_session, workspace_name, str(generate_nanoid())
+    )
+    session = await _create_session(db_session, workspace_name)
+    await _join_scope(db_session, workspace_name, session.name, scope_peer.name)
+    await _create_collection(
+        db_session, workspace_name, observer=sender.name, observed=sender.name
+    )
+    await _create_collection(
+        db_session, workspace_name, observer=scope_peer.name, observed=sender.name
+    )
+    await _create_document(
+        db_session,
+        workspace_name,
+        observer=sender.name,
+        observed=sender.name,
+        session_name=session.name,
+    )
+    scope_peer_name_str = scope_peer.name
+    session_name_str = session.name
+    sender_name_str = sender.name
+    backfill = ScopeBackfillPayload(
+        scope_peer=scope_peer_name_str, session_name=session_name_str
+    )
+    removal = ScopeRemovalPayload(
+        scope_peer=scope_peer_name_str, session_name=session_name_str
+    )
+    await process_scope_backfill(backfill, workspace_name)
+    await db_session.execute(
+        update(models.SessionPeer)
+        .where(
+            models.SessionPeer.workspace_name == workspace_name,
+            models.SessionPeer.session_name == session_name_str,
+            models.SessionPeer.peer_name == scope_peer_name_str,
+        )
+        .values(left_at=func.now())
+    )
+    await db_session.commit()
+
+    factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
+    readd_finished = asyncio.Event()
+    readd_task_box: dict[str, asyncio.Task[None]] = {}
+
+    async def concurrent_readd() -> None:
+        async with factory() as readd_db:
+            await readd_db.execute(
+                update(models.SessionPeer)
+                .where(
+                    models.SessionPeer.workspace_name == workspace_name,
+                    models.SessionPeer.session_name == session_name_str,
+                    models.SessionPeer.peer_name == scope_peer_name_str,
+                )
+                .values(left_at=None)
+            )
+            await readd_db.commit()
+        await process_scope_backfill(backfill, workspace_name)
+        readd_finished.set()
+
+    original_tracked_db = scope_backfill_mod.tracked_db  # pyright: ignore[reportPrivateLocalImportUsage]
+
+    @asynccontextmanager
+    async def tracked_db_with_readd_race(
+        operation_name: str | None = None, *, read_only: bool = False
+    ) -> AsyncGenerator[AsyncSession]:
+        async with original_tracked_db(operation_name, read_only=read_only) as db:
+            if operation_name == "scope_removal":
+                real_scalar = db.scalar
+                raced = False
+
+                async def scalar_then_race(statement: Any, *args: Any, **kwargs: Any):
+                    nonlocal raced
+                    result = await real_scalar(statement, *args, **kwargs)
+                    if not raced and result is not None:
+                        raced = True
+                        readd_task_box["task"] = asyncio.create_task(concurrent_readd())
+                        for _ in range(50):
+                            await asyncio.sleep(0.01)
+                            if readd_task_box["task"].done():
+                                break
+                        assert not readd_task_box["task"].done()
+                    return result
+
+                db.scalar = scalar_then_race  # type: ignore[method-assign]
+            yield db
+
+    monkeypatch.setattr(scope_backfill_mod, "tracked_db", tracked_db_with_readd_race)
+    await process_scope_removal(removal, workspace_name)
+    await asyncio.wait_for(readd_task_box["task"], timeout=5.0)
+    assert readd_finished.is_set()
+
+    live = await _get_docs(
+        db_session,
+        workspace_name,
+        observer=scope_peer_name_str,
+        observed=sender_name_str,
+        include_deleted=False,
+    )
+    assert len(live) == 1
+    db_session.expire_all()
+    refreshed_scope = await db_session.scalar(
+        select(models.Peer)
+        .where(models.Peer.workspace_name == workspace_name)
+        .where(models.Peer.name == scope_peer_name_str)
+    )
+    assert refreshed_scope is not None
+    assert session_name_str in refreshed_scope.internal_metadata.get(
+        "backfill_status", {}
+    )
+
+
 async def test_backfill_skips_a_session_that_left_the_scope(
     db_session: AsyncSession,
     sample_data: tuple[models.Workspace, models.Peer],
