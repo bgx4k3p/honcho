@@ -671,8 +671,18 @@ async def process_scope_removal(
                 await external_vector_store.delete_many(namespace, removed_ids)
             except Exception:
                 logger.exception(
-                    "Failed to delete removed vectors from %s; reconciler sweep will retry",
+                    "External vector deletion returned an ambiguous failure for %s; repairing any concurrent re-add before retry",
                     namespace,
+                )
+                # The backend may have applied a partial/full delete before a
+                # timeout or transport error. Repair active re-adds even on the
+                # exception path; otherwise a live row can remain falsely
+                # synced while its vector is absent.
+                await _mark_readded_vectors_pending(
+                    workspace_name,
+                    scope_peer,
+                    session_name,
+                    removed_ids,
                 )
                 continue
             try:

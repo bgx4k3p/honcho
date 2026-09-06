@@ -448,7 +448,7 @@ async def test_stale_removal_after_readd_preserves_live_copy_and_status(
 
 
 @pytest.mark.asyncio
-async def test_removal_lock_blocks_readd_then_backfill_restores_one_copy(
+async def test_ambiguous_delete_after_readd_leaves_vector_repair_pending(
     db_session: AsyncSession,
     sample_data: tuple[models.Workspace, models.Peer],
     db_engine: AsyncEngine,
@@ -503,6 +503,7 @@ async def test_removal_lock_blocks_readd_then_backfill_restores_one_copy(
             # Force the old removal delete to linearize after the re-add upsert.
             await asyncio.wait_for(self.readd_upserted.wait(), timeout=5.0)
             self.vectors.difference_update(ids)
+            raise TimeoutError("ambiguous timeout after backend delete")
 
     vector_store = RacingVectorStore()
     monkeypatch.setattr(
@@ -522,6 +523,7 @@ async def test_removal_lock_blocks_readd_then_backfill_restores_one_copy(
 
     factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
     readd_finished = asyncio.Event()
+    repair_committed = asyncio.Event()
     readd_task_box: dict[str, asyncio.Task[None]] = {}
 
     async def concurrent_readd() -> None:
@@ -546,6 +548,13 @@ async def test_removal_lock_blocks_readd_then_backfill_restores_one_copy(
         operation_name: str | None = None, *, read_only: bool = False
     ) -> AsyncGenerator[AsyncSession]:
         async with original_tracked_db(operation_name, read_only=read_only) as db:
+            if (
+                operation_name == "scope_backfill.sync_state"
+                and vector_store.upsert_calls >= 2
+            ):
+                # Pin the CAS ordering: repair commits first, then the stale
+                # backfill attempts its final `synced` transition.
+                await asyncio.wait_for(repair_committed.wait(), timeout=5.0)
             if operation_name == "scope_removal":
                 real_scalar = db.scalar
                 raced = False
@@ -565,6 +574,8 @@ async def test_removal_lock_blocks_readd_then_backfill_restores_one_copy(
 
                 db.scalar = scalar_then_race  # type: ignore[method-assign]
             yield db
+        if operation_name == "scope_removal.readd_vector_repair":
+            repair_committed.set()
 
     monkeypatch.setattr(scope_backfill_mod, "tracked_db", tracked_db_with_readd_race)
     await process_scope_removal(removal, workspace_name)
