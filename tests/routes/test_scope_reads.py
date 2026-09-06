@@ -8,6 +8,7 @@ session-allowlist arm).
 """
 
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -401,6 +402,64 @@ class TestRepresentationWithScope:
         )
         assert resp.status_code == 200
         assert "fact" not in resp.json()["representation"]
+
+    async def test_scope_list_revokes_removed_session(
+        self,
+        client: TestClient,
+        db_session: AsyncSession,
+        sample_data: tuple[Workspace, Peer],
+    ):
+        workspace, peer = sample_data
+        scope_name = str(generate_nanoid())
+        _create_scope(client, workspace.name, scope_name)
+        session_name = _create_session(client, workspace.name)
+        _add_sessions_to_scope(client, workspace.name, scope_name, [session_name])
+        await _seed_documents(
+            db_session,
+            workspace.name,
+            observer=peer.name,
+            observed=peer.name,
+            contents=[("removed scope fact", session_name)],
+        )
+
+        response = client.delete(
+            f"/v3/workspaces/{workspace.name}/scopes/{scope_name}/sessions/{session_name}"
+        )
+        assert response.status_code == 204
+        response = client.post(
+            f"/v3/workspaces/{workspace.name}/peers/{peer.name}/representation",
+            json={"scope": [scope_name]},
+        )
+        assert response.status_code == 200
+        assert "removed scope fact" not in response.json()["representation"]
+
+
+class TestWorkspaceMessageSearchWithScope:
+    def test_removed_last_session_returns_no_results(
+        self,
+        client: TestClient,
+        sample_data: tuple[Workspace, Peer],
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        workspace, _ = sample_data
+        scope_name = str(generate_nanoid())
+        _create_scope(client, workspace.name, scope_name)
+        session_name = _create_session(client, workspace.name)
+        _add_sessions_to_scope(client, workspace.name, scope_name, [session_name])
+        response = client.delete(
+            f"/v3/workspaces/{workspace.name}/scopes/{scope_name}/sessions/{session_name}"
+        )
+        assert response.status_code == 204
+
+        search = AsyncMock(return_value=[object()])
+        monkeypatch.setattr("src.routers.workspaces.search", search)
+        response = client.post(
+            f"/v3/workspaces/{workspace.name}/search",
+            json={"query": "must remain bounded", "scope": scope_name},
+        )
+        assert response.status_code == 200
+        assert response.json() == []
+        search.assert_not_awaited()
 
 
 class TestChatWithScope:

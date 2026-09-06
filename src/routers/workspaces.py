@@ -176,7 +176,7 @@ async def search_workspace(
                 scope_db, workspace_id, [body.scope]
             )
             scope_sessions = await get_peer_session_names(
-                scope_db, workspace_id, scope_peer
+                scope_db, workspace_id, scope_peer, active_only=True
             )
         if not scope_sessions:
             # A scope with no member sessions matches nothing, not everything.

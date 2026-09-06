@@ -331,7 +331,7 @@ async def resolve_scope_session_union(
     seen: set[str] = set()
     for scope_peer in await resolve_scope_peers(db, workspace_name, scope_names):
         for session_name in await get_peer_session_names(
-            db, workspace_name, scope_peer
+            db, workspace_name, scope_peer, active_only=True
         ):
             if session_name not in seen:
                 seen.add(session_name)
