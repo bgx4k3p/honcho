@@ -501,6 +501,23 @@ async def process_scope_removal(
 
     removed_by_observed: dict[str, list[str]] = {}
     async with tracked_db("scope_removal") as db:
+        membership = await db.scalar(
+            select(models.SessionPeer)
+            .where(
+                models.SessionPeer.workspace_name == workspace_name,
+                models.SessionPeer.session_name == session_name,
+                models.SessionPeer.peer_name == scope_peer,
+            )
+            .with_for_update()
+        )
+        if membership is not None and membership.left_at is None:
+            logger.info(
+                "Skipping stale scope removal for active membership %s/%s/%s",
+                workspace_name,
+                scope_peer,
+                session_name,
+            )
+            return
         observed_result = await db.execute(
             select(models.Collection.observed).where(
                 models.Collection.workspace_name == workspace_name,

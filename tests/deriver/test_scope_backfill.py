@@ -331,6 +331,16 @@ async def test_add_remove_readd_converges_on_one_live_copy(
     # add
     await process_scope_backfill(backfill_payload, workspace_name)
     # remove
+    await db_session.execute(
+        update(models.SessionPeer)
+        .where(
+            models.SessionPeer.workspace_name == workspace_name,
+            models.SessionPeer.session_name == session.name,
+            models.SessionPeer.peer_name == scope_peer.name,
+        )
+        .values(left_at=func.now())
+    )
+    await db_session.commit()
     await process_scope_removal(removal_payload, workspace_name)
     live = await _get_docs(
         db_session,
@@ -341,6 +351,16 @@ async def test_add_remove_readd_converges_on_one_live_copy(
     )
     assert live == []
     # re-add
+    await db_session.execute(
+        update(models.SessionPeer)
+        .where(
+            models.SessionPeer.workspace_name == workspace_name,
+            models.SessionPeer.session_name == session.name,
+            models.SessionPeer.peer_name == scope_peer.name,
+        )
+        .values(left_at=None)
+    )
+    await db_session.commit()
     await process_scope_backfill(backfill_payload, workspace_name)
 
     all_copies = await _get_docs(
@@ -349,6 +369,82 @@ async def test_add_remove_readd_converges_on_one_live_copy(
     live_copies = [d for d in all_copies if d.deleted_at is None]
     assert len(all_copies) == 1  # restored, not duplicated
     assert len(live_copies) == 1
+
+
+async def test_stale_removal_after_readd_preserves_live_copy_and_status(
+    db_session: AsyncSession,
+    sample_data: tuple[models.Workspace, models.Peer],
+):
+    test_workspace, sender = sample_data
+    workspace_name = test_workspace.name
+    scope_name = str(generate_nanoid())
+    scope_peer = await _create_scope_peer(db_session, workspace_name, scope_name)
+    session = await _create_session(db_session, workspace_name)
+    await _join_scope(db_session, workspace_name, session.name, scope_peer.name)
+    await _create_collection(
+        db_session, workspace_name, observer=sender.name, observed=sender.name
+    )
+    await _create_document(
+        db_session,
+        workspace_name,
+        observer=sender.name,
+        observed=sender.name,
+        session_name=session.name,
+    )
+    await _create_collection(
+        db_session, workspace_name, observer=scope_peer.name, observed=sender.name
+    )
+    backfill = ScopeBackfillPayload(
+        scope_peer=scope_peer.name, session_name=session.name
+    )
+    removal = ScopeRemovalPayload(scope_peer=scope_peer.name, session_name=session.name)
+    await process_scope_backfill(backfill, workspace_name)
+
+    # A leave queues `removal`, but the membership is reactivated and its
+    # backfill converges before that old removal job finally runs.
+    await db_session.execute(
+        update(models.SessionPeer)
+        .where(
+            models.SessionPeer.workspace_name == workspace_name,
+            models.SessionPeer.session_name == session.name,
+            models.SessionPeer.peer_name == scope_peer.name,
+        )
+        .values(left_at=func.now())
+    )
+    await db_session.commit()
+    await db_session.execute(
+        update(models.SessionPeer)
+        .where(
+            models.SessionPeer.workspace_name == workspace_name,
+            models.SessionPeer.session_name == session.name,
+            models.SessionPeer.peer_name == scope_peer.name,
+        )
+        .values(left_at=None)
+    )
+    await db_session.commit()
+    await process_scope_backfill(backfill, workspace_name)
+    await process_scope_removal(removal, workspace_name)
+
+    live = await _get_docs(
+        db_session,
+        workspace_name,
+        observer=scope_peer.name,
+        observed=sender.name,
+        include_deleted=False,
+    )
+    assert len(live) == 1
+    scope_peer_name_str = scope_peer.name
+    session_name_str = session.name
+    db_session.expire_all()
+    refreshed_scope = await db_session.scalar(
+        select(models.Peer)
+        .where(models.Peer.workspace_name == workspace_name)
+        .where(models.Peer.name == scope_peer_name_str)
+    )
+    assert refreshed_scope is not None
+    assert session_name_str in refreshed_scope.internal_metadata.get(
+        "backfill_status", {}
+    )
 
 
 async def test_backfill_skips_a_session_that_left_the_scope(
@@ -652,9 +748,25 @@ async def test_removal_cascades_to_dependent_derived_docs_only(
     )
 
     copy_id, dependent_id, unrelated_id = copy.id, dependent.id, unrelated.id
+    scope_peer_name_str = scope_peer.name
+    session_name_str = session.name
+    sender_name_str = sender.name
+
+    await db_session.execute(
+        update(models.SessionPeer)
+        .where(
+            models.SessionPeer.workspace_name == workspace_name,
+            models.SessionPeer.session_name == session_name_str,
+            models.SessionPeer.peer_name == scope_peer_name_str,
+        )
+        .values(left_at=func.now())
+    )
+    await db_session.commit()
 
     await process_scope_removal(
-        ScopeRemovalPayload(scope_peer=scope_peer.name, session_name=session.name),
+        ScopeRemovalPayload(
+            scope_peer=scope_peer_name_str, session_name=session_name_str
+        ),
         workspace_name,
     )
 
@@ -666,8 +778,8 @@ async def test_removal_cascades_to_dependent_derived_docs_only(
     result = await db_session.execute(
         select(models.Document.id, models.Document.deleted_at).where(
             models.Document.workspace_name == workspace_name,
-            models.Document.observer == scope_peer.name,
-            models.Document.observed == sender.name,
+            models.Document.observer == scope_peer_name_str,
+            models.Document.observed == sender_name_str,
         )
     )
     deleted_at_by_id = {row[0]: row[1] for row in result.all()}

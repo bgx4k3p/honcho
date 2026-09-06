@@ -910,8 +910,13 @@ async def get_session_context(
     # A scope swaps the perspective source: the scope peer becomes the
     # observer for both the working representation and the peer card, so the
     # scoped collection and scoped card are read instead of the global ones.
+    scope_session_allowlist: list[str] | None = None
     if scope is not None:
         [observer] = await crud.resolve_scope_peers(db, workspace_id, [scope])
+        scope_session_allowlist = normalize_session_allowlist(
+            await get_peer_session_names(db, workspace_id, observer, active_only=True),
+            field="scope",
+        )
 
     # Pre-compute embedding outside the DB session (best-effort)
     embedding: list[float] | None = None
@@ -932,9 +937,13 @@ async def get_session_context(
     # `must_include=session_id` guarantees at least this session — so the
     # None-check is the only distinction that matters.
     effective_allowlist = (
-        session_allowlist
-        if session_allowlist is not None
-        else ([session_id] if limit_to_session else None)
+        scope_session_allowlist
+        if scope_session_allowlist is not None
+        else (
+            session_allowlist
+            if session_allowlist is not None
+            else ([session_id] if limit_to_session else None)
+        )
     )
 
     # Sequential calls on shared DB session
@@ -961,11 +970,9 @@ async def get_session_context(
     # Gated on the *effective* allowlist, not on `sessions` alone:
     # `limit_to_session=true` narrows recall identically, so carving out only the
     # newer parameter would leave a control that one parameter swap defeats.
-    # `scope` needs no carve-out at all — it swaps the observer to the scope peer
-    # above, so the card read below is the scope's own.
-    #
-    # POST /peers/{id}/chat still injects an unscoped card under an allowlist
-    # (src/dialectic/chat.py) — tracked in DEV-2201, not fixed here.
+    # `scope` now contributes its active session allowlist too, so stale scope
+    # cards are withheld until the asynchronous removal reconciliation rebuilds
+    # them from currently admitted evidence.
     card = (
         None
         if effective_allowlist is not None

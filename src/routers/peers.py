@@ -55,27 +55,32 @@ async def _resolve_scope_option(
 ) -> tuple[str | None, list[str] | None]:
     """Map a validated `scope` option to (observer_override, session_allowlist).
 
-    A single scope swaps the observer to the scope peer: conclusion recall is
-    then confined to the (scope, observed) collection and message recall to
-    the scope's session membership by existing observer semantics. A list of
-    scopes keeps the path peer as observer and returns the union of the
-    scopes' member sessions as an explicit allowlist (fail-closed when empty).
+    A single scope swaps the observer to the scope peer. Every scalar or list
+    form also returns an explicit active-membership allowlist so removal takes
+    effect immediately instead of inheriting ordinary peers' intentionally
+    historical observer semantics.
     """
     async with tracked_db(db_action, read_only=True) as scope_db:
+        observer_override: str | None = None
         if isinstance(scope, str):
             [scope_peer] = await crud.resolve_scope_peers(
                 scope_db, workspace_id, [scope]
             )
-            return scope_peer, None
-
-        union = await crud.resolve_scope_session_union(scope_db, workspace_id, scope)
+            observer_override = scope_peer
+            union = await get_peer_session_names(
+                scope_db, workspace_id, scope_peer, active_only=True
+            )
+        else:
+            union = await crud.resolve_scope_session_union(
+                scope_db, workspace_id, scope
+            )
 
     if len(union) > MAX_SESSION_ALLOWLIST_ENTRIES:
         raise ValidationException(
             "The scopes' combined membership exceeds the maximum of "
             + f"{MAX_SESSION_ALLOWLIST_ENTRIES} sessions per request"
         )
-    return None, union
+    return observer_override, union
 
 
 @router.post(
