@@ -483,6 +483,31 @@ async def test_removal_lock_blocks_readd_then_backfill_restores_one_copy(
     removal = ScopeRemovalPayload(
         scope_peer=scope_peer_name_str, session_name=session_name_str
     )
+
+    class RacingVectorStore:
+        def __init__(self) -> None:
+            self.vectors: set[str] = set()
+            self.upsert_calls = 0
+            self.readd_upserted = asyncio.Event()
+
+        def get_vector_namespace(self, *_args: str) -> str:
+            return "scope-test"
+
+        async def upsert_many(self, _namespace: str, records: list[Any]) -> None:
+            self.upsert_calls += 1
+            self.vectors.update(record.id for record in records)
+            if self.upsert_calls == 2:
+                self.readd_upserted.set()
+
+        async def delete_many(self, _namespace: str, ids: list[str]) -> None:
+            # Force the old removal delete to linearize after the re-add upsert.
+            await asyncio.wait_for(self.readd_upserted.wait(), timeout=5.0)
+            self.vectors.difference_update(ids)
+
+    vector_store = RacingVectorStore()
+    monkeypatch.setattr(
+        scope_backfill_mod, "get_external_vector_store", lambda: vector_store
+    )
     await process_scope_backfill(backfill, workspace_name)
     await db_session.execute(
         update(models.SessionPeer)
@@ -546,15 +571,19 @@ async def test_removal_lock_blocks_readd_then_backfill_restores_one_copy(
     await asyncio.wait_for(readd_task_box["task"], timeout=5.0)
     assert readd_finished.is_set()
 
-    live = await _get_docs(
-        db_session,
-        workspace_name,
-        observer=scope_peer_name_str,
-        observed=sender_name_str,
-        include_deleted=False,
-    )
-    assert len(live) == 1
     db_session.expire_all()
+    live_result = await db_session.execute(
+        select(models.Document.id, models.Document.sync_state).where(
+            models.Document.workspace_name == workspace_name,
+            models.Document.observer == scope_peer_name_str,
+            models.Document.observed == sender_name_str,
+            models.Document.deleted_at.is_(None),
+        )
+    )
+    live = live_result.all()
+    assert len(live) == 1
+    assert live[0].sync_state == "pending"
+    assert live[0].id not in vector_store.vectors
     refreshed_scope = await db_session.scalar(
         select(models.Peer)
         .where(models.Peer.workspace_name == workspace_name)
