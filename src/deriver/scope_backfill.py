@@ -361,11 +361,39 @@ async def _copy_chunk(
                 db, workspace_name, observer=scope_peer, observed=observed
             )
 
-        restore_ids: list[str] = []
+        # Serialize restoration against the ordinary soft-delete reconciler. A
+        # cleanup transaction may have selected a planned restore row before
+        # this transaction began; FOR UPDATE waits for it and then READ
+        # COMMITTED rechecks whether the row still exists. Missing rows are
+        # recreated with a fresh client-side id instead of silently issuing a
+        # zero-row UPDATE and upserting an orphan vector for the vanished id.
+        planned_restore_ids = [
+            spec.restore_document_id
+            for spec in plans
+            if spec.restore_document_id is not None
+        ]
+        locked_restores: dict[str, models.Document] = {}
+        if planned_restore_ids:
+            restore_result = await db.execute(
+                select(models.Document)
+                .where(models.Document.id.in_(planned_restore_ids))
+                .with_for_update()
+            )
+            locked_restores = {row.id: row for row in restore_result.scalars().all()}
+
         for spec in plans:
-            if spec.restore_document_id is not None:
-                restore_ids.append(spec.restore_document_id)
+            restore = (
+                locked_restores.get(spec.restore_document_id)
+                if spec.restore_document_id is not None
+                else None
+            )
+            if restore is not None:
+                restore.deleted_at = None
+                restore.sync_state = "pending"
+                restore.last_sync_at = sync_generation
+                restore.sync_attempts = 0
                 continue
+
             row = models.Document(
                 workspace_name=workspace_name,
                 observer=scope_peer,
@@ -384,19 +412,9 @@ async def _copy_chunk(
             row.sync_state = "pending"
             row.last_sync_at = sync_generation
             new_rows.append(row)
+            spec.restore_document_id = None
 
         db.add_all(new_rows)
-        if restore_ids:
-            await db.execute(
-                update(models.Document)
-                .where(models.Document.id.in_(restore_ids))
-                .values(
-                    deleted_at=None,
-                    sync_state="pending",
-                    last_sync_at=sync_generation,
-                    sync_attempts=0,
-                )
-            )
         await db.commit()
 
         # IDs are generated client-side and remain accessible post-commit
