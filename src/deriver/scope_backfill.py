@@ -26,6 +26,7 @@ own short-lived session.
 
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import exists, or_, select, update
@@ -334,7 +335,11 @@ async def _copy_chunk(
         for spec, embedding in zip(missing, embeddings, strict=True):
             spec.embedding = embedding
 
-    # Phase 3 (DB): write the copies.
+    # Phase 3 (DB): write the copies. This generation is a compare-and-set
+    # token for the post-upsert sync-state transition. A concurrent removal
+    # can replace it after deleting vectors, preventing a stale upsert worker
+    # from marking a now-missing vector as synced.
+    sync_generation = datetime.now(UTC)
     touched_observed = {spec.observed for spec in plans}
     new_rows: list[models.Document] = []
     async with tracked_db("scope_backfill.write") as db:
@@ -357,11 +362,39 @@ async def _copy_chunk(
                 db, workspace_name, observer=scope_peer, observed=observed
             )
 
-        restore_ids: list[str] = []
+        # Serialize restoration against the ordinary soft-delete reconciler. A
+        # cleanup transaction may have selected a planned restore row before
+        # this transaction began; FOR UPDATE waits for it and then READ
+        # COMMITTED rechecks whether the row still exists. Missing rows are
+        # recreated with a fresh client-side id instead of silently issuing a
+        # zero-row UPDATE and upserting an orphan vector for the vanished id.
+        planned_restore_ids = [
+            spec.restore_document_id
+            for spec in plans
+            if spec.restore_document_id is not None
+        ]
+        locked_restores: dict[str, models.Document] = {}
+        if planned_restore_ids:
+            restore_result = await db.execute(
+                select(models.Document)
+                .where(models.Document.id.in_(planned_restore_ids))
+                .with_for_update()
+            )
+            locked_restores = {row.id: row for row in restore_result.scalars().all()}
+
         for spec in plans:
-            if spec.restore_document_id is not None:
-                restore_ids.append(spec.restore_document_id)
+            restore = (
+                locked_restores.get(spec.restore_document_id)
+                if spec.restore_document_id is not None
+                else None
+            )
+            if restore is not None:
+                restore.deleted_at = None
+                restore.sync_state = "pending"
+                restore.last_sync_at = sync_generation
+                restore.sync_attempts = 0
                 continue
+
             row = models.Document(
                 workspace_name=workspace_name,
                 observer=scope_peer,
@@ -378,15 +411,11 @@ async def _copy_chunk(
                 embedding=spec.embedding if store_in_postgres else None,
             )
             row.sync_state = "pending"
+            row.last_sync_at = sync_generation
             new_rows.append(row)
+            spec.restore_document_id = None
 
         db.add_all(new_rows)
-        if restore_ids:
-            await db.execute(
-                update(models.Document)
-                .where(models.Document.id.in_(restore_ids))
-                .values(deleted_at=None, sync_state="pending")
-            )
         await db.commit()
 
         # IDs are generated client-side and remain accessible post-commit
@@ -404,7 +433,13 @@ async def _copy_chunk(
 
     # Phase 4: sync to the external vector store (or mark synced in pgvector
     # mode). Failures leave rows in sync_state='pending' for the reconciler.
-    await _sync_copies_to_vector_store(workspace_name, scope_peer, plans, copied_ids)
+    await _sync_copies_to_vector_store(
+        workspace_name,
+        scope_peer,
+        plans,
+        copied_ids,
+        sync_generation,
+    )
     return True
 
 
@@ -413,6 +448,7 @@ async def _sync_copies_to_vector_store(
     scope_peer: str,
     plans: list[_CopySpec],
     copied_ids: list[str],
+    sync_generation: datetime,
 ) -> None:
     """Mirror the document-create sync path for the backfilled copies."""
     external_vector_store = get_external_vector_store()
@@ -422,7 +458,12 @@ async def _sync_copies_to_vector_store(
         async with tracked_db("scope_backfill.mark_synced") as db:
             await db.execute(
                 update(models.Document)
-                .where(models.Document.id.in_(copied_ids))
+                .where(
+                    models.Document.id.in_(copied_ids),
+                    models.Document.deleted_at.is_(None),
+                    models.Document.sync_state == "pending",
+                    models.Document.last_sync_at == sync_generation,
+                )
                 .values(sync_state="synced", last_sync_at=func.now(), sync_attempts=0)
             )
             await db.commit()
@@ -468,13 +509,23 @@ async def _sync_copies_to_vector_store(
         if synced_ids:
             await db.execute(
                 update(models.Document)
-                .where(models.Document.id.in_(synced_ids))
+                .where(
+                    models.Document.id.in_(synced_ids),
+                    models.Document.deleted_at.is_(None),
+                    models.Document.sync_state == "pending",
+                    models.Document.last_sync_at == sync_generation,
+                )
                 .values(sync_state="synced", last_sync_at=func.now(), sync_attempts=0)
             )
         if failed_ids:
             await db.execute(
                 update(models.Document)
-                .where(models.Document.id.in_(failed_ids))
+                .where(
+                    models.Document.id.in_(failed_ids),
+                    models.Document.deleted_at.is_(None),
+                    models.Document.sync_state == "pending",
+                    models.Document.last_sync_at == sync_generation,
+                )
                 .values(
                     sync_attempts=models.Document.sync_attempts + 1,
                     last_sync_at=func.now(),
@@ -486,6 +537,47 @@ async def _sync_copies_to_vector_store(
 # ---------------------------------------------------------------------------
 # Removal reconciliation (session removed from a scope)
 # ---------------------------------------------------------------------------
+
+
+async def _mark_readded_vectors_pending(
+    workspace_name: str,
+    scope_peer: str,
+    session_name: str,
+    document_ids: list[str],
+) -> None:
+    """Repair the delete-after-readd external-vector race fail-closed.
+
+    External deletion runs after the removal DB commit. If membership was
+    reactivated while that delete was in flight, the delete may have landed
+    after the re-add's upsert. Mark the still-live rows pending so the vector
+    reconciler recreates them. The membership lock makes this decision atomic
+    with a subsequent leave; the generation CAS in the upsert worker prevents
+    its stale final state transition from overwriting this repair marker.
+    """
+    if not document_ids:
+        return
+    async with tracked_db("scope_removal.readd_vector_repair") as db:
+        membership = await db.scalar(
+            select(models.SessionPeer.peer_name)
+            .where(
+                models.SessionPeer.workspace_name == workspace_name,
+                models.SessionPeer.session_name == session_name,
+                models.SessionPeer.peer_name == scope_peer,
+                models.SessionPeer.left_at.is_(None),
+            )
+            .with_for_update()
+        )
+        if membership is None:
+            return
+        await db.execute(
+            update(models.Document)
+            .where(
+                models.Document.id.in_(document_ids),
+                models.Document.deleted_at.is_(None),
+            )
+            .values(sync_state="pending", last_sync_at=None, sync_attempts=0)
+        )
+        await db.commit()
 
 
 async def process_scope_removal(
@@ -502,6 +594,35 @@ async def process_scope_removal(
 
     removed_by_observed: dict[str, list[str]] = {}
     async with tracked_db("scope_removal") as db:
+        membership = await db.scalar(
+            select(models.SessionPeer)
+            .where(
+                models.SessionPeer.workspace_name == workspace_name,
+                models.SessionPeer.session_name == session_name,
+                models.SessionPeer.peer_name == scope_peer,
+            )
+            .with_for_update()
+        )
+        if membership is not None and membership.left_at is None:
+            await db.execute(
+                update(models.Document)
+                .where(
+                    models.Document.workspace_name == workspace_name,
+                    models.Document.observer == scope_peer,
+                    models.Document.session_name == session_name,
+                    models.Document.internal_metadata.has_key(COPIED_FROM_KEY),
+                    models.Document.deleted_at.is_(None),
+                )
+                .values(sync_state="pending", last_sync_at=None, sync_attempts=0)
+            )
+            await db.commit()
+            logger.info(
+                "Skipping stale scope removal and reconciling live vectors for active membership %s/%s/%s",
+                workspace_name,
+                scope_peer,
+                session_name,
+            )
+            return
         observed_result = await db.execute(
             select(models.Collection.observed).where(
                 models.Collection.workspace_name == workspace_name,
@@ -577,9 +698,33 @@ async def process_scope_removal(
                 await external_vector_store.delete_many(namespace, removed_ids)
             except Exception:
                 logger.exception(
-                    "Failed to delete removed vectors from %s; reconciler sweep will retry",
+                    "External vector deletion returned an ambiguous failure for %s; repairing any concurrent re-add before retry",
                     namespace,
                 )
+                # The backend may have applied a partial/full delete before a
+                # timeout or transport error. Repair active re-adds even on the
+                # exception path; otherwise a live row can remain falsely
+                # synced while its vector is absent.
+                await _mark_readded_vectors_pending(
+                    workspace_name,
+                    scope_peer,
+                    session_name,
+                    removed_ids,
+                )
+                continue
+            try:
+                await _mark_readded_vectors_pending(
+                    workspace_name,
+                    scope_peer,
+                    session_name,
+                    removed_ids,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to record post-delete re-add repair for %s; retrying removal reconciliation",
+                    namespace,
+                )
+                raise
 
     # Rebuild what remains: the card must be regenerated from remaining
     # evidence only (rebuild=True drops the stale card from the prompt), and a

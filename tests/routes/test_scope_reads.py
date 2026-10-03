@@ -8,6 +8,7 @@ session-allowlist arm).
 """
 
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -402,6 +403,106 @@ class TestRepresentationWithScope:
         assert resp.status_code == 200
         assert "fact" not in resp.json()["representation"]
 
+    async def test_scalar_scope_revokes_removed_session(
+        self,
+        client: TestClient,
+        db_session: AsyncSession,
+        sample_data: tuple[Workspace, Peer],
+    ):
+        workspace, peer = sample_data
+        scope_name = str(generate_nanoid())
+        _create_scope(client, workspace.name, scope_name)
+        session_name = _create_session(client, workspace.name)
+        _add_sessions_to_scope(client, workspace.name, scope_name, [session_name])
+        await _seed_documents(
+            db_session,
+            workspace.name,
+            observer=scope_peer_name(scope_name),
+            observed=peer.name,
+            contents=[("removed scalar scope fact", session_name)],
+        )
+
+        response = client.post(
+            f"/v3/workspaces/{workspace.name}/peers/{peer.name}/representation",
+            json={"scope": scope_name},
+        )
+        assert response.status_code == 200
+        assert "removed scalar scope fact" in response.json()["representation"]
+        response = client.delete(
+            f"/v3/workspaces/{workspace.name}/scopes/{scope_name}/sessions/{session_name}"
+        )
+        assert response.status_code == 204
+        response = client.post(
+            f"/v3/workspaces/{workspace.name}/peers/{peer.name}/representation",
+            json={"scope": scope_name},
+        )
+        assert response.status_code == 200
+        assert "removed scalar scope fact" not in response.json()["representation"]
+
+    async def test_scope_list_revokes_removed_session(
+        self,
+        client: TestClient,
+        db_session: AsyncSession,
+        sample_data: tuple[Workspace, Peer],
+    ):
+        workspace, peer = sample_data
+        scope_name = str(generate_nanoid())
+        _create_scope(client, workspace.name, scope_name)
+        session_name = _create_session(client, workspace.name)
+        _add_sessions_to_scope(client, workspace.name, scope_name, [session_name])
+        await _seed_documents(
+            db_session,
+            workspace.name,
+            observer=peer.name,
+            observed=peer.name,
+            contents=[("removed list scope fact", session_name)],
+        )
+
+        response = client.post(
+            f"/v3/workspaces/{workspace.name}/peers/{peer.name}/representation",
+            json={"scope": [scope_name]},
+        )
+        assert response.status_code == 200
+        assert "removed list scope fact" in response.json()["representation"]
+        response = client.delete(
+            f"/v3/workspaces/{workspace.name}/scopes/{scope_name}/sessions/{session_name}"
+        )
+        assert response.status_code == 204
+        response = client.post(
+            f"/v3/workspaces/{workspace.name}/peers/{peer.name}/representation",
+            json={"scope": [scope_name]},
+        )
+        assert response.status_code == 200
+        assert "removed list scope fact" not in response.json()["representation"]
+
+
+class TestWorkspaceMessageSearchWithScope:
+    def test_removed_last_session_returns_no_results(
+        self,
+        client: TestClient,
+        sample_data: tuple[Workspace, Peer],
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        workspace, _ = sample_data
+        scope_name = str(generate_nanoid())
+        _create_scope(client, workspace.name, scope_name)
+        session_name = _create_session(client, workspace.name)
+        _add_sessions_to_scope(client, workspace.name, scope_name, [session_name])
+        response = client.delete(
+            f"/v3/workspaces/{workspace.name}/scopes/{scope_name}/sessions/{session_name}"
+        )
+        assert response.status_code == 204
+
+        search = AsyncMock(return_value=[object()])
+        monkeypatch.setattr("src.routers.workspaces.search", search)
+        response = client.post(
+            f"/v3/workspaces/{workspace.name}/search",
+            json={"query": "must remain bounded", "scope": scope_name},
+        )
+        assert response.status_code == 200
+        assert response.json() == []
+        search.assert_not_awaited()
+
 
 class TestChatWithScope:
     """Verify what the chat route hands the dialectic, without real LLM work.
@@ -432,8 +533,32 @@ class TestChatWithScope:
         # The scope peer is the observer; the path peer stays the observed
         assert kwargs["observer"] == scope_peer_name(scope_name)
         assert kwargs["observed"] == peer.name
-        # Single-scope confinement rides on observer semantics, not an allowlist
-        assert kwargs["session_allowlist"] is None
+        assert kwargs["session_allowlist"] == []
+
+    def test_scalar_scope_revokes_removed_session_immediately(
+        self,
+        client: TestClient,
+        sample_data: tuple[Workspace, Peer],
+        mock_llm_call_functions: dict[str, Any],
+    ):
+        workspace, peer = sample_data
+        scope_name = str(generate_nanoid())
+        _create_scope(client, workspace.name, scope_name)
+        session_name = _create_session(client, workspace.name)
+        _add_sessions_to_scope(client, workspace.name, scope_name, [session_name])
+        response = client.delete(
+            f"/v3/workspaces/{workspace.name}/scopes/{scope_name}/sessions/{session_name}"
+        )
+        assert response.status_code == 204
+
+        response = client.post(
+            f"/v3/workspaces/{workspace.name}/peers/{peer.name}/chat",
+            json={"query": "what do you know?", "scope": scope_name},
+        )
+        assert response.status_code == 200
+        kwargs = mock_llm_call_functions["agentic_chat"].await_args.kwargs
+        assert kwargs["observer"] == scope_peer_name(scope_name)
+        assert kwargs["session_allowlist"] == []
 
     def test_scope_list_passes_union_allowlist(
         self,
@@ -595,7 +720,13 @@ class TestWorkspaceSearchWithScope:
         _create_scope(client, workspace.name, scope_name)
         session_a = _create_session(client, workspace.name, peers={peer.name: {}})
         session_b = _create_session(client, workspace.name, peers={peer.name: {}})
-        _add_sessions_to_scope(client, workspace.name, scope_name, [session_a])
+        _add_sessions_to_scope(
+            client, workspace.name, scope_name, [session_a, session_b]
+        )
+        response = client.delete(
+            f"/v3/workspaces/{workspace.name}/scopes/{scope_name}/sessions/{session_b}"
+        )
+        assert response.status_code == 204
         self._seed_message(client, workspace.name, session_a, peer)
         self._seed_message(client, workspace.name, session_b, peer)
 
@@ -723,7 +854,20 @@ class TestSessionContextWithScope:
         data = resp.json()
         assert "scoped fact about hiking" in data["peer_representation"]
         assert "global fact about cooking" not in data["peer_representation"]
-        assert data["peer_card"] == ["SCOPED CARD"]
+        assert data["peer_card"] is None
+
+        response = client.delete(
+            f"/v3/workspaces/{workspace.name}/scopes/{scope_name}/sessions/{session_name}"
+        )
+        assert response.status_code == 204
+        resp = client.get(
+            f"/v3/workspaces/{workspace.name}/sessions/{session_name}/context",
+            params={"peer_target": peer.name, "scope": scope_name},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "scoped fact about hiking" not in data["peer_representation"]
+        assert data["peer_card"] is None
 
     def test_scope_requires_peer_target(
         self, client: TestClient, sample_data: tuple[Workspace, Peer]

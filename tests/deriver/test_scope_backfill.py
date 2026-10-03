@@ -23,6 +23,7 @@ connection that cannot see another session's uncommitted writes.
 """
 
 import asyncio
+import datetime
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -34,6 +35,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from src import crud, models
+from src.crud.document import cleanup_soft_deleted_documents
 from src.deriver import scope_backfill as scope_backfill_mod
 from src.deriver.scope_backfill import (
     COPIED_FROM_KEY,
@@ -331,6 +333,16 @@ async def test_add_remove_readd_converges_on_one_live_copy(
     # add
     await process_scope_backfill(backfill_payload, workspace_name)
     # remove
+    await db_session.execute(
+        update(models.SessionPeer)
+        .where(
+            models.SessionPeer.workspace_name == workspace_name,
+            models.SessionPeer.session_name == session.name,
+            models.SessionPeer.peer_name == scope_peer.name,
+        )
+        .values(left_at=func.now())
+    )
+    await db_session.commit()
     await process_scope_removal(removal_payload, workspace_name)
     live = await _get_docs(
         db_session,
@@ -341,6 +353,16 @@ async def test_add_remove_readd_converges_on_one_live_copy(
     )
     assert live == []
     # re-add
+    await db_session.execute(
+        update(models.SessionPeer)
+        .where(
+            models.SessionPeer.workspace_name == workspace_name,
+            models.SessionPeer.session_name == session.name,
+            models.SessionPeer.peer_name == scope_peer.name,
+        )
+        .values(left_at=None)
+    )
+    await db_session.commit()
     await process_scope_backfill(backfill_payload, workspace_name)
 
     all_copies = await _get_docs(
@@ -349,6 +371,364 @@ async def test_add_remove_readd_converges_on_one_live_copy(
     live_copies = [d for d in all_copies if d.deleted_at is None]
     assert len(all_copies) == 1  # restored, not duplicated
     assert len(live_copies) == 1
+
+
+@pytest.mark.asyncio
+async def test_readd_recreates_copy_if_cleanup_hard_deletes_planned_restore(
+    db_session: AsyncSession,
+    sample_data: tuple[models.Workspace, models.Peer],
+    db_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A stale restore plan must not upsert an orphan after cleanup wins."""
+    test_workspace, sender = sample_data
+    workspace_name = test_workspace.name
+    scope_peer = await _create_scope_peer(
+        db_session, workspace_name, str(generate_nanoid())
+    )
+    session = await _create_session(db_session, workspace_name)
+    await _join_scope(db_session, workspace_name, session.name, scope_peer.name)
+    await _create_collection(
+        db_session, workspace_name, observer=sender.name, observed=sender.name
+    )
+    await _create_document(
+        db_session,
+        workspace_name,
+        observer=sender.name,
+        observed=sender.name,
+        session_name=session.name,
+    )
+    await _create_collection(
+        db_session, workspace_name, observer=scope_peer.name, observed=sender.name
+    )
+    backfill = ScopeBackfillPayload(
+        scope_peer=scope_peer.name, session_name=session.name
+    )
+    removal = ScopeRemovalPayload(scope_peer=scope_peer.name, session_name=session.name)
+    await process_scope_backfill(backfill, workspace_name)
+    original_copy = (
+        await _get_docs(
+            db_session,
+            workspace_name,
+            observer=scope_peer.name,
+            observed=sender.name,
+        )
+    )[0]
+    original_id = original_copy.id
+
+    await db_session.execute(
+        update(models.SessionPeer)
+        .where(
+            models.SessionPeer.workspace_name == workspace_name,
+            models.SessionPeer.session_name == session.name,
+            models.SessionPeer.peer_name == scope_peer.name,
+        )
+        .values(left_at=func.now())
+    )
+    await db_session.commit()
+    await process_scope_removal(removal, workspace_name)
+    await db_session.execute(
+        update(models.Document)
+        .where(models.Document.id == original_id)
+        .values(
+            deleted_at=datetime.datetime.now(datetime.UTC)
+            - datetime.timedelta(minutes=10)
+        )
+    )
+    await db_session.execute(
+        update(models.SessionPeer)
+        .where(
+            models.SessionPeer.workspace_name == workspace_name,
+            models.SessionPeer.session_name == session.name,
+            models.SessionPeer.peer_name == scope_peer.name,
+        )
+        .values(left_at=None)
+    )
+    await db_session.commit()
+
+    deleted_vectors: list[str] = []
+
+    class CleanupStore:
+        def get_vector_namespace(self, *_args: str) -> str:
+            return "scope-cleanup-race"
+
+        async def delete_many(self, _namespace: str, ids: list[str]) -> None:
+            deleted_vectors.extend(ids)
+
+    original_hydrate = scope_backfill_mod._hydrate_chunk_embeddings
+    cleanup_ran = False
+
+    async def cleanup_after_restore_plan(
+        planned_workspace: str, plans: list[Any]
+    ) -> None:
+        nonlocal cleanup_ran
+        assert plans[0].restore_document_id == original_id
+        factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
+        async with factory() as cleanup_db:
+            cleaned = await cleanup_soft_deleted_documents(
+                cleanup_db,
+                CleanupStore(),
+                older_than_minutes=5,  # type: ignore[arg-type]
+            )
+        assert cleaned == 1
+        cleanup_ran = True
+        await original_hydrate(planned_workspace, plans)
+
+    monkeypatch.setattr(
+        scope_backfill_mod, "_hydrate_chunk_embeddings", cleanup_after_restore_plan
+    )
+    await process_scope_backfill(backfill, workspace_name)
+
+    scope_peer_name_str = scope_peer.name
+    sender_name_str = sender.name
+    db_session.expire_all()
+    copies = await _get_docs(
+        db_session,
+        workspace_name,
+        observer=scope_peer_name_str,
+        observed=sender_name_str,
+    )
+    assert cleanup_ran
+    assert deleted_vectors == [original_id]
+    assert len(copies) == 1
+    assert copies[0].id != original_id
+    assert copies[0].deleted_at is None
+    assert copies[0].sync_state == "synced"
+
+
+async def test_stale_removal_after_readd_preserves_live_copy_and_status(
+    db_session: AsyncSession,
+    sample_data: tuple[models.Workspace, models.Peer],
+):
+    test_workspace, sender = sample_data
+    workspace_name = test_workspace.name
+    scope_name = str(generate_nanoid())
+    scope_peer = await _create_scope_peer(db_session, workspace_name, scope_name)
+    session = await _create_session(db_session, workspace_name)
+    await _join_scope(db_session, workspace_name, session.name, scope_peer.name)
+    await _create_collection(
+        db_session, workspace_name, observer=sender.name, observed=sender.name
+    )
+    await _create_document(
+        db_session,
+        workspace_name,
+        observer=sender.name,
+        observed=sender.name,
+        session_name=session.name,
+    )
+    await _create_collection(
+        db_session, workspace_name, observer=scope_peer.name, observed=sender.name
+    )
+    backfill = ScopeBackfillPayload(
+        scope_peer=scope_peer.name, session_name=session.name
+    )
+    removal = ScopeRemovalPayload(scope_peer=scope_peer.name, session_name=session.name)
+    await process_scope_backfill(backfill, workspace_name)
+
+    # A leave queues `removal`, but the membership is reactivated and its
+    # backfill converges before that old removal job finally runs.
+    await db_session.execute(
+        update(models.SessionPeer)
+        .where(
+            models.SessionPeer.workspace_name == workspace_name,
+            models.SessionPeer.session_name == session.name,
+            models.SessionPeer.peer_name == scope_peer.name,
+        )
+        .values(left_at=func.now())
+    )
+    await db_session.commit()
+    await db_session.execute(
+        update(models.SessionPeer)
+        .where(
+            models.SessionPeer.workspace_name == workspace_name,
+            models.SessionPeer.session_name == session.name,
+            models.SessionPeer.peer_name == scope_peer.name,
+        )
+        .values(left_at=None)
+    )
+    await db_session.commit()
+    await process_scope_backfill(backfill, workspace_name)
+    await process_scope_removal(removal, workspace_name)
+
+    live = await _get_docs(
+        db_session,
+        workspace_name,
+        observer=scope_peer.name,
+        observed=sender.name,
+        include_deleted=False,
+    )
+    assert len(live) == 1
+    scope_peer_name_str = scope_peer.name
+    session_name_str = session.name
+    db_session.expire_all()
+    refreshed_scope = await db_session.scalar(
+        select(models.Peer)
+        .where(models.Peer.workspace_name == workspace_name)
+        .where(models.Peer.name == scope_peer_name_str)
+    )
+    assert refreshed_scope is not None
+    assert session_name_str in refreshed_scope.internal_metadata.get(
+        "backfill_status", {}
+    )
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_delete_after_readd_leaves_vector_repair_pending(
+    db_session: AsyncSession,
+    sample_data: tuple[models.Workspace, models.Peer],
+    db_engine: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    test_workspace, sender = sample_data
+    workspace_name = test_workspace.name
+    scope_peer = await _create_scope_peer(
+        db_session, workspace_name, str(generate_nanoid())
+    )
+    session = await _create_session(db_session, workspace_name)
+    await _join_scope(db_session, workspace_name, session.name, scope_peer.name)
+    await _create_collection(
+        db_session, workspace_name, observer=sender.name, observed=sender.name
+    )
+    await _create_collection(
+        db_session, workspace_name, observer=scope_peer.name, observed=sender.name
+    )
+    await _create_document(
+        db_session,
+        workspace_name,
+        observer=sender.name,
+        observed=sender.name,
+        session_name=session.name,
+    )
+    scope_peer_name_str = scope_peer.name
+    session_name_str = session.name
+    sender_name_str = sender.name
+    backfill = ScopeBackfillPayload(
+        scope_peer=scope_peer_name_str, session_name=session_name_str
+    )
+    removal = ScopeRemovalPayload(
+        scope_peer=scope_peer_name_str, session_name=session_name_str
+    )
+
+    class RacingVectorStore:
+        def __init__(self) -> None:
+            self.vectors: set[str] = set()
+            self.upsert_calls = 0
+            self.readd_upserted = asyncio.Event()
+
+        def get_vector_namespace(self, *_args: str) -> str:
+            return "scope-test"
+
+        async def upsert_many(self, _namespace: str, records: list[Any]) -> None:
+            self.upsert_calls += 1
+            self.vectors.update(record.id for record in records)
+            if self.upsert_calls == 2:
+                self.readd_upserted.set()
+
+        async def delete_many(self, _namespace: str, ids: list[str]) -> None:
+            # Force the old removal delete to linearize after the re-add upsert.
+            await asyncio.wait_for(self.readd_upserted.wait(), timeout=5.0)
+            self.vectors.difference_update(ids)
+            raise TimeoutError("ambiguous timeout after backend delete")
+
+    vector_store = RacingVectorStore()
+    monkeypatch.setattr(
+        scope_backfill_mod, "get_external_vector_store", lambda: vector_store
+    )
+    await process_scope_backfill(backfill, workspace_name)
+    await db_session.execute(
+        update(models.SessionPeer)
+        .where(
+            models.SessionPeer.workspace_name == workspace_name,
+            models.SessionPeer.session_name == session_name_str,
+            models.SessionPeer.peer_name == scope_peer_name_str,
+        )
+        .values(left_at=func.now())
+    )
+    await db_session.commit()
+
+    factory = async_sessionmaker(bind=db_engine, expire_on_commit=False)
+    readd_finished = asyncio.Event()
+    repair_committed = asyncio.Event()
+    readd_task_box: dict[str, asyncio.Task[None]] = {}
+
+    async def concurrent_readd() -> None:
+        async with factory() as readd_db:
+            await readd_db.execute(
+                update(models.SessionPeer)
+                .where(
+                    models.SessionPeer.workspace_name == workspace_name,
+                    models.SessionPeer.session_name == session_name_str,
+                    models.SessionPeer.peer_name == scope_peer_name_str,
+                )
+                .values(left_at=None)
+            )
+            await readd_db.commit()
+        await process_scope_backfill(backfill, workspace_name)
+        readd_finished.set()
+
+    original_tracked_db = scope_backfill_mod.tracked_db  # pyright: ignore[reportPrivateLocalImportUsage]
+
+    @asynccontextmanager
+    async def tracked_db_with_readd_race(
+        operation_name: str | None = None, *, read_only: bool = False
+    ) -> AsyncGenerator[AsyncSession]:
+        async with original_tracked_db(operation_name, read_only=read_only) as db:
+            if (
+                operation_name == "scope_backfill.sync_state"
+                and vector_store.upsert_calls >= 2
+            ):
+                # Pin the CAS ordering: repair commits first, then the stale
+                # backfill attempts its final `synced` transition.
+                await asyncio.wait_for(repair_committed.wait(), timeout=5.0)
+            if operation_name == "scope_removal":
+                real_scalar = db.scalar
+                raced = False
+
+                async def scalar_then_race(statement: Any, *args: Any, **kwargs: Any):
+                    nonlocal raced
+                    result = await real_scalar(statement, *args, **kwargs)
+                    if not raced and result is not None:
+                        raced = True
+                        readd_task_box["task"] = asyncio.create_task(concurrent_readd())
+                        for _ in range(50):
+                            await asyncio.sleep(0.01)
+                            if readd_task_box["task"].done():
+                                break
+                        assert not readd_task_box["task"].done()
+                    return result
+
+                db.scalar = scalar_then_race  # type: ignore[method-assign]
+            yield db
+        if operation_name == "scope_removal.readd_vector_repair":
+            repair_committed.set()
+
+    monkeypatch.setattr(scope_backfill_mod, "tracked_db", tracked_db_with_readd_race)
+    await process_scope_removal(removal, workspace_name)
+    await asyncio.wait_for(readd_task_box["task"], timeout=5.0)
+    assert readd_finished.is_set()
+
+    db_session.expire_all()
+    live_result = await db_session.execute(
+        select(models.Document.id, models.Document.sync_state).where(
+            models.Document.workspace_name == workspace_name,
+            models.Document.observer == scope_peer_name_str,
+            models.Document.observed == sender_name_str,
+            models.Document.deleted_at.is_(None),
+        )
+    )
+    live = live_result.all()
+    assert len(live) == 1
+    assert live[0].sync_state == "pending"
+    assert live[0].id not in vector_store.vectors
+    refreshed_scope = await db_session.scalar(
+        select(models.Peer)
+        .where(models.Peer.workspace_name == workspace_name)
+        .where(models.Peer.name == scope_peer_name_str)
+    )
+    assert refreshed_scope is not None
+    assert session_name_str in refreshed_scope.internal_metadata.get(
+        "backfill_status", {}
+    )
 
 
 async def test_backfill_skips_a_session_that_left_the_scope(
@@ -652,9 +1032,25 @@ async def test_removal_cascades_to_dependent_derived_docs_only(
     )
 
     copy_id, dependent_id, unrelated_id = copy.id, dependent.id, unrelated.id
+    scope_peer_name_str = scope_peer.name
+    session_name_str = session.name
+    sender_name_str = sender.name
+
+    await db_session.execute(
+        update(models.SessionPeer)
+        .where(
+            models.SessionPeer.workspace_name == workspace_name,
+            models.SessionPeer.session_name == session_name_str,
+            models.SessionPeer.peer_name == scope_peer_name_str,
+        )
+        .values(left_at=func.now())
+    )
+    await db_session.commit()
 
     await process_scope_removal(
-        ScopeRemovalPayload(scope_peer=scope_peer.name, session_name=session.name),
+        ScopeRemovalPayload(
+            scope_peer=scope_peer_name_str, session_name=session_name_str
+        ),
         workspace_name,
     )
 
@@ -666,8 +1062,8 @@ async def test_removal_cascades_to_dependent_derived_docs_only(
     result = await db_session.execute(
         select(models.Document.id, models.Document.deleted_at).where(
             models.Document.workspace_name == workspace_name,
-            models.Document.observer == scope_peer.name,
-            models.Document.observed == sender.name,
+            models.Document.observer == scope_peer_name_str,
+            models.Document.observed == sender_name_str,
         )
     )
     deleted_at_by_id = {row[0]: row[1] for row in result.all()}

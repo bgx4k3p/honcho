@@ -103,7 +103,7 @@ async def agentic_chat(
 
         observer_peer_card = None
         observed_peer_card = None
-        if configuration.peer_card.use:
+        if configuration.peer_card.use and session_allowlist is None:
             observer_peer_card = await crud.get_peer_card(
                 db, workspace_name, observer=observer, observed=observer
             )
@@ -186,7 +186,7 @@ async def agentic_chat_stream(
 
         observer_peer_card = None
         observed_peer_card = None
-        if configuration.peer_card.use:
+        if configuration.peer_card.use and session_allowlist is None:
             observer_peer_card = await crud.get_peer_card(
                 db, workspace_name, observer=observer, observed=observer
             )
